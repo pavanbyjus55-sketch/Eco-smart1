@@ -1,0 +1,242 @@
+'use strict';
+/*
+  ================================================================
+  EcoSmart Serial Bridge — FIXED VERSION
+  Arduino → PC → Website
+  ================================================================
+
+  HOW TO RUN:
+    Open a terminal / command prompt in this folder, then:
+
+    Windows:
+      set SERIAL_PORT=COM3 && node bridge.js
+      (replace COM3 with your actual port from Device Manager)
+
+    Mac:
+      SERIAL_PORT=/dev/tty.usbmodem14101 node bridge.js
+
+    Linux:
+      SERIAL_PORT=/dev/ttyACM0 node bridge.js
+
+  TO FIND YOUR PORT:
+    Windows: Device Manager → Ports (COM & LPT) → Arduino Uno (COMx)
+    Mac:     Run: ls /dev/tty.usbmodem*
+    Linux:   Run: ls /dev/ttyACM*
+
+  IMPORTANT:
+    Close Arduino IDE Serial Monitor BEFORE running this.
+    Both cannot use the same port at the same time.
+  ================================================================
+*/
+
+const { SerialPort }     = require('serialport');
+const { ReadlineParser } = require('@serialport/parser-readline');
+const http               = require('http');
+
+// ── SETTINGS — change these to match your setup ──────────────
+const SERIAL_PORT  = process.env.SERIAL_PORT || 'COM3';   // ← change this
+const BAUD_RATE    = 9600;
+const SERVER_HOST  = process.env.SERVER_HOST || 'localhost';
+const SERVER_PORT  = parseInt(process.env.SERVER_PORT)  || 5000;
+
+// ── BIN LOCATIONS — update with your real locations ──────────
+// The location and address are shown in the admin alert message.
+const BIN_LOCATIONS = {
+  BIN001: {
+    location : 'Lab Room, Building A',
+    address  : 'EcoSmart Lab, Near Main Gate, Mysuru',
+    lat      : 12.2958,
+    lng      : 76.6394
+  },
+  BIN002: {
+    location : 'Corridor, Ground Floor',
+    address  : 'Ground Floor Corridor, Near Lift, Mysuru',
+    lat      : 12.2960,
+    lng      : 76.6395
+  }
+};
+
+// ── STATE ────────────────────────────────────────────────────
+let isConnected = false;
+
+// ─────────────────────────────────────────────────────────────
+function ts() {
+  return new Date().toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  });
+}
+
+function banner() {
+  console.log('\n  ╔══════════════════════════════════════════════╗');
+  console.log('  ║      EcoSmart Bridge — FIXED VERSION         ║');
+  console.log('  ╠══════════════════════════════════════════════╣');
+  console.log(`  ║  Port   : ${SERIAL_PORT.padEnd(35)}║`);
+  console.log(`  ║  Server : http://${(SERVER_HOST + ':' + SERVER_PORT).padEnd(28)}║`);
+  console.log('  ╠══════════════════════════════════════════════╣');
+  console.log('  ║  Waiting for Arduino...                      ║');
+  console.log('  ╚══════════════════════════════════════════════╝\n');
+}
+
+// ── CHECK SERVER IS RUNNING ───────────────────────────────────
+function checkServer() {
+  return new Promise(resolve => {
+    const req = http.request(
+      { hostname: SERVER_HOST, port: SERVER_PORT, path: '/api/bins', method: 'GET' },
+      res => { resolve(true); }
+    );
+    req.on('error', () => resolve(false));
+    req.setTimeout(3000, () => { req.destroy(); resolve(false); });
+    req.end();
+  });
+}
+
+// ── SEND DATA TO SERVER ───────────────────────────────────────
+function postSensor(binId, payload) {
+  return new Promise(resolve => {
+    const body = JSON.stringify(payload);
+    const req  = http.request({
+      hostname: SERVER_HOST,
+      port    : SERVER_PORT,
+      path    : `/api/sensor/${binId}`,
+      method  : 'POST',
+      headers : {
+        'Content-Type'  : 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
+    }, res => {
+      let raw = '';
+      res.on('data', c => raw += c);
+      res.on('end',  () => {
+        try { resolve(JSON.parse(raw)); }
+        catch { resolve(null); }
+      });
+    });
+
+    req.on('error', err => {
+      console.error(`  [${ts()}] Cannot reach server: ${err.message}`);
+      console.error('           → Make sure "node server.js" is running in backend folder\n');
+      resolve(null);
+    });
+
+    req.setTimeout(5000, () => { req.destroy(); resolve(null); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── PROCESS ONE LINE FROM ARDUINO ─────────────────────────────
+async function handleLine(raw) {
+  const line = raw.trim();
+  if (!line || !line.startsWith('{')) return;
+
+  let data;
+  try   { data = JSON.parse(line); }
+  catch {
+    console.log(`  [${ts()}] Could not parse: ${line.substring(0, 60)}`);
+    return;
+  }
+
+  // Boot message from Arduino
+  if (data.status) {
+    console.log(`  [${ts()}] Arduino BIN ${data.bid || ''} → ${data.status.toUpperCase()}`);
+    return;
+  }
+
+  const { bid, lvl, full, ir, tmp, hum } = data;
+  if (!bid) return;
+
+  const info   = BIN_LOCATIONS[bid] || { location: bid, address: bid, lat: 0, lng: 0 };
+  const isFull = full === true || full === 'true';
+  const label  = isFull ? 'FULL' : lvl >= 70 ? 'WARNING' : 'OK';
+
+  // Console log — shows every reading clearly
+  const tempStr = (tmp !== undefined && tmp >= 0) ? `${parseFloat(tmp).toFixed(1)}°C` : 'N/A';
+  const humStr  = (hum !== undefined && hum >= 0) ? `${Math.round(hum)}%`             : 'N/A';
+
+  console.log(
+    `  [${ts()}]` +
+    `  Bin: ${bid}` +
+    `  |  Fill: ${String(Math.round(lvl || 0)).padStart(3)}%` +
+    `  |  IR: ${ir ? 'YES' : 'no '}` +
+    `  |  Temp: ${tempStr.padEnd(7)}` +
+    `  |  Humidity: ${humStr.padEnd(5)}` +
+    `  |  [${label}]`
+  );
+
+  // Build payload for server — includes ALL sensor data
+  const payload = {
+    level   : Math.round(lvl || 0),
+    full    : isFull,
+    ir      : ir ? 1 : 0,
+    temp    : (tmp !== undefined && tmp >= 0) ? parseFloat(tmp) : null,
+    hum     : (hum !== undefined && hum >= 0) ? parseFloat(hum) : null,
+    location: info.location,
+    address : info.address,
+    lat     : info.lat,
+    lng     : info.lng
+  };
+
+  const result = await postSensor(bid, payload);
+
+  // Server confirmed alert was sent
+  if (result && result.alertSent) {
+    console.log('');
+    console.log('  ╔══════════════════════════════════════════╗');
+    console.log('  ║  ALERT SENT TO ADMIN                     ║');
+    console.log(`  ║  Bin     : ${bid.padEnd(30)}║`);
+    console.log(`  ║  Level   : ${(Math.round(lvl) + '%').padEnd(30)}║`);
+    console.log(`  ║  Temp    : ${tempStr.padEnd(30)}║`);
+    console.log(`  ║  Where   : ${info.location.slice(0, 30).padEnd(30)}║`);
+    console.log('  ║  Message : Dustbin is full, please clear ║');
+    console.log('  ╚══════════════════════════════════════════╝');
+    console.log('');
+  }
+}
+
+// ── OPEN SERIAL PORT ──────────────────────────────────────────
+async function startBridge() {
+  banner();
+
+  // Check server first
+  const serverOk = await checkServer();
+  if (!serverOk) {
+    console.error('  ERROR: Cannot connect to EcoSmart server.');
+    console.error(`  → Expected server at http://${SERVER_HOST}:${SERVER_PORT}`);
+    console.error('  → Open a NEW terminal and run:  cd backend && node server.js');
+    console.error('  → Then run this bridge again.\n');
+    process.exit(1);
+  }
+  console.log(`  [${ts()}] Server OK at http://${SERVER_HOST}:${SERVER_PORT}`);
+
+  const port   = new SerialPort({ path: SERIAL_PORT, baudRate: BAUD_RATE });
+  const parser = port.pipe(new ReadlineParser({ delimiter: '\n' }));
+
+  port.on('open', () => {
+    isConnected = true;
+    console.log(`  [${ts()}] Arduino connected on ${SERIAL_PORT}`);
+    console.log(`  [${ts()}] Reading sensor data — LED on Arduino blinks every 5s\n`);
+  });
+
+  port.on('error', err => {
+    console.error('\n  ERROR: Cannot open serial port.');
+    console.error(`  Port: ${SERIAL_PORT}`);
+    console.error(`  Reason: ${err.message}\n`);
+    console.error('  FIX — try one of these:');
+    console.error('  1. Close Arduino IDE Serial Monitor');
+    console.error('  2. Change port:  set SERIAL_PORT=COM4 && node bridge.js');
+    console.error('  3. Check Device Manager for correct port number\n');
+    process.exit(1);
+  });
+
+  port.on('close', () => {
+    if (isConnected) {
+      isConnected = false;
+      console.log(`\n  [${ts()}] Arduino disconnected. Reconnecting in 5s...\n`);
+      setTimeout(startBridge, 5000);
+    }
+  });
+
+  parser.on('data', handleLine);
+}
+
+startBridge();
